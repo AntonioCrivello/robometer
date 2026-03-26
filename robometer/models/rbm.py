@@ -9,6 +9,7 @@ heads or there will be some problems with FSDP sharding.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PreTrainedModel, Qwen2_5_VLModel
 
 try:
@@ -871,9 +872,48 @@ class RBM(PredictionHeadsMixin, PreTrainedModel):
                 progress_list.append(torch.empty(0, device=hidden.device))
                 success_list.append(torch.empty(0, device=hidden.device))
 
-        progress = torch.stack(progress_list) if progress_list else None
-        success = torch.stack(success_list) if success_list else None
+        progress = self._pad_and_stack(progress_list)
+        success = self._pad_and_stack(success_list)
         return progress, success
+
+    @staticmethod
+    def _pad_and_stack(tensors: list[torch.Tensor]) -> torch.Tensor | None:
+        """Pad variable-length tensors to max length and stack into a batch.
+
+        Handles the case where different batch items have different numbers of
+        tokens (e.g., trajectories of different lengths produce different numbers
+        of <|prog_token|> outputs).
+        """
+        if not tensors:
+            return None
+
+        non_empty = [t for t in tensors if t.numel() > 0]
+        if not non_empty:
+            return None
+
+        max_len = max(t.shape[0] for t in non_empty)
+
+        # If all same length, just stack directly (no padding needed)
+        if all(t.shape[0] == max_len for t in non_empty) and len(non_empty) == len(tensors):
+            return torch.stack(tensors)
+
+        padded = []
+        for t in tensors:
+            if t.numel() == 0:
+                pad_shape = (max_len, *non_empty[0].shape[1:])
+                padded.append(torch.zeros(pad_shape, device=non_empty[0].device, dtype=non_empty[0].dtype))
+            elif t.shape[0] < max_len:
+                # Pad along dim 0 (sequence length)
+                # F.pad pads from last dim backwards: (left, right, top, bottom, ...)
+                if t.dim() == 1:
+                    padded.append(F.pad(t, (0, max_len - t.shape[0])))
+                else:
+                    # For 2D [seq, bins]: pad dim 0 only
+                    padded.append(F.pad(t, (0, 0, 0, max_len - t.shape[0])))
+            else:
+                padded.append(t)
+
+        return torch.stack(padded)
 
     def _process_token_extraction(
         self,
