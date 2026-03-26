@@ -19,7 +19,7 @@ Troubleshooting:
     ``RuntimeError: CUDA driver error: invalid argument`` on torch.prod or
     torch.special.entr, clear the CUDA kernel cache:
         rm -rf ~/.nv/ComputeCache
-    Then re-run. This is a known issue. See:  
+    Then re-run. This is a known issue. See:
     https://github.com/pytorch/pytorch/issues/156010
 """
 
@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,9 +45,7 @@ import torch.multiprocessing as mp
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
 # TFRecord Feature Helpers
-# =============================================================================
 
 # Lazy import TensorFlow to avoid slow startup when just checking --help
 _tf = None
@@ -73,10 +72,7 @@ def _float_feature(value: float):
     return tf.train.Feature(float_list=tf.train.FloatList(value=[value]))
 
 
-# =============================================================================
 # Observation Fingerprinting (numpy port of JAX version)
-# =============================================================================
-
 
 def cheap_fingerprint32(img: np.ndarray) -> int:
     """Compute a fast 32-bit fingerprint of an image for verification.
@@ -101,6 +97,33 @@ def cheap_fingerprint32(img: np.ndarray) -> int:
     acc = (acc ^ (acc >> np.uint32(13))) * np.uint32(0xC2B2AE35)
     acc = acc ^ (acc >> np.uint32(16))
     return int(acc)
+
+
+def cheap_fingerprint32_batch(imgs: np.ndarray) -> list[int]:
+    """Vectorized fingerprint for a batch of images.
+
+    Args:
+        imgs: uint8 numpy array of shape (T, H, W, C).
+
+    Returns:
+        List of T int fingerprints, identical to calling cheap_fingerprint32
+        on each frame individually.
+    """
+    if imgs.dtype != np.uint8:
+        imgs = np.clip(imgs, 0.0, 255.0).astype(np.uint8)
+
+    T, H, W = imgs.shape[0], imgs.shape[1], imgs.shape[2]
+    ys = np.array([0, H // 3, 2 * H // 3, H - 1], dtype=np.int32)
+    xs = np.array([0, W // 3, 2 * W // 3, W - 1], dtype=np.int32)
+    # Extract patches for all frames at once: (T, 4, 4, C) -> (T, 48)
+    patches = imgs[:, ys[:, None], xs[None, :], :].reshape(T, -1).astype(np.uint32)
+
+    acc = np.full(T, 0x9E3779B9, dtype=np.uint32)
+    acc ^= np.bitwise_xor.reduce(patches * np.uint32(0x1B873593), axis=1)
+    acc = (acc ^ (acc >> np.uint32(16))) * np.uint32(0x85EBCA6B)
+    acc = (acc ^ (acc >> np.uint32(13))) * np.uint32(0xC2B2AE35)
+    acc ^= acc >> np.uint32(16)
+    return acc.tolist()
 
 
 # =============================================================================
@@ -292,8 +315,9 @@ def write_annotation_tfrecord(
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+    num_entries = len(original_indices) if original_indices else len(progress)
     with tf.io.TFRecordWriter(output_path) as writer:
-        for t in range(len(progress)):
+        for t in range(num_entries):
             idx = original_indices[t] if original_indices else t
             feature = {
                 "frame_idx": _int64_feature(idx),
@@ -511,6 +535,262 @@ def run_robometer_inference_batched(
 
 
 # =============================================================================
+# Pipelined Batch Preparation & Post-Processing
+# =============================================================================
+
+
+@dataclass
+class PreparedBatch:
+    """Result of CPU-side batch preparation (TFRecord reading + collation)."""
+    batch_frames: list[tuple[np.ndarray, list[int]]]  # (frames, orig_indices) per traj
+    batch_valid_indices: list[int]  # dataset indices that were successfully read
+    progress_inputs: dict  # collated tensors ready for .to(device)
+    is_discrete: bool
+    num_bins: int
+    traj_lengths: list[int]
+    batch_total_frames: int
+
+
+def prepare_batch(
+    batch_indices: list[int],
+    dataset_info: DatasetInfo,
+    task: str,
+    frame_step: int,
+    batch_collator,
+    exp_config,
+    rank: int,
+) -> PreparedBatch | None:
+    """CPU-only: read TFRecords + collate. Safe to run in a background thread.
+
+    Returns None if no valid trajectories in this batch.
+    """
+    from robometer.data.dataset_types import ProgressSample, Trajectory
+
+    # Read frames — parallel across trajectories in this batch
+    def _read_one(idx):
+        tfrecord_path = dataset_info.file_paths[idx]
+        num_frames = dataset_info.episode_lengths[idx]
+        encoding = dataset_info.encodings[idx]
+        if not os.path.exists(tfrecord_path):
+            logger.warning(f"[Worker {rank}] Missing file: {tfrecord_path}, skipping")
+            return idx, None, None
+        frames, orig_indices = read_trajectory_frames(
+            tfrecord_path, num_frames, encoding, frame_step=frame_step,
+        )
+        if frames.shape[0] == 0:
+            logger.warning(f"[Worker {rank}] Empty trajectory: {tfrecord_path}")
+            return idx, None, None
+        return idx, frames, orig_indices
+
+    # Use threads to read multiple TFRecords concurrently
+    read_workers = min(4, len(batch_indices))
+    batch_frames = []
+    batch_valid_indices = []
+    if read_workers > 1:
+        with ThreadPoolExecutor(max_workers=read_workers) as read_pool:
+            futures = [read_pool.submit(_read_one, idx) for idx in batch_indices]
+            # Collect in submission order to maintain ordering
+            for future in futures:
+                idx, frames, orig_indices = future.result()
+                if frames is not None:
+                    batch_frames.append((frames, orig_indices))
+                    batch_valid_indices.append(idx)
+    else:
+        for idx in batch_indices:
+            idx, frames, orig_indices = _read_one(idx)
+            if frames is not None:
+                batch_frames.append((frames, orig_indices))
+                batch_valid_indices.append(idx)
+
+    if not batch_frames:
+        return None
+
+    # Build ProgressSample objects and collate
+    frames_list = [f for f, _ in batch_frames]
+    traj_lengths = [int(f.shape[0]) for f in frames_list]
+    progress_samples = []
+    for i, frames in enumerate(frames_list):
+        T = traj_lengths[i]
+        traj = Trajectory(
+            frames=frames,
+            frames_shape=tuple(frames.shape),
+            task=task,
+            id=str(i),
+            metadata={"subsequence_length": T},
+            video_embeddings=None,
+        )
+        progress_samples.append(
+            ProgressSample(trajectory=traj, sample_type="progress")
+        )
+
+    batch = batch_collator(progress_samples)
+    progress_inputs = batch["progress_inputs"]
+
+    # Precompute loss config
+    loss_config = getattr(exp_config, "loss", None)
+    is_discrete = (
+        getattr(loss_config, "progress_loss_type", "l2").lower() == "discrete"
+        if loss_config
+        else False
+    )
+    num_bins = getattr(loss_config, "progress_discrete_bins", None) or getattr(
+        exp_config.model, "progress_discrete_bins", 10
+    )
+
+    batch_total_frames = sum(traj_lengths)
+
+    return PreparedBatch(
+        batch_frames=batch_frames,
+        batch_valid_indices=batch_valid_indices,
+        progress_inputs=progress_inputs,
+        is_discrete=is_discrete,
+        num_bins=num_bins,
+        traj_lengths=traj_lengths,
+        batch_total_frames=batch_total_frames,
+    )
+
+
+def _gpu_inference_single(
+    progress_inputs: dict,
+    device: torch.device,
+    reward_model,
+    tokenizer,
+    is_discrete: bool,
+    num_bins: int,
+    traj_lengths: list[int],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Run a single GPU forward pass and unpack results."""
+    from robometer.evals.eval_server import compute_batch_outputs
+
+    for key, value in progress_inputs.items():
+        if hasattr(value, "to"):
+            progress_inputs[key] = value.to(device, non_blocking=True)
+
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        results = compute_batch_outputs(
+            reward_model,
+            tokenizer,
+            progress_inputs,
+            sample_type="progress",
+            is_discrete_mode=is_discrete,
+            num_bins=num_bins,
+        )
+
+    # Unpack per-trajectory results
+    progress_pred = results.get("progress_pred", [])
+    outputs_success = results.get("outputs_success", {})
+    success_probs = (
+        outputs_success.get("success_probs", []) if outputs_success else []
+    )
+
+    output = []
+    for i in range(len(traj_lengths)):
+        T = traj_lengths[i]
+        if progress_pred and i < len(progress_pred) and progress_pred[i]:
+            prog = np.array(progress_pred[i], dtype=np.float32)
+        else:
+            prog = np.zeros(T, dtype=np.float32)
+        if success_probs and i < len(success_probs) and success_probs[i]:
+            succ = np.array(success_probs[i], dtype=np.float32)
+        else:
+            succ = np.zeros(T, dtype=np.float32)
+        output.append((prog, succ))
+
+    return output
+
+
+def gpu_inference(
+    prepared: PreparedBatch,
+    device: torch.device,
+    reward_model,
+    tokenizer,
+    batch_collator,
+    task: str,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """GPU inference with automatic OOM retry at half batch size."""
+    try:
+        return _gpu_inference_single(
+            prepared.progress_inputs, device, reward_model, tokenizer,
+            prepared.is_discrete, prepared.num_bins, prepared.traj_lengths,
+        )
+    except torch.cuda.OutOfMemoryError:
+        n = len(prepared.batch_frames)
+        logger.warning(
+            f"OOM with {n} trajectories "
+            f"(max {max(prepared.traj_lengths)} frames). "
+            f"Retrying in two halves..."
+        )
+        torch.cuda.empty_cache()
+
+        # Re-collate and run each half separately
+        from robometer.data.dataset_types import ProgressSample, Trajectory
+
+        all_results = []
+        mid = n // 2
+        for sub_frames_list in [prepared.batch_frames[:mid], prepared.batch_frames[mid:]]:
+            if not sub_frames_list:
+                continue
+            frames_only = [f for f, _ in sub_frames_list]
+            sub_lengths = [int(f.shape[0]) for f in frames_only]
+            samples = []
+            for i, frames in enumerate(frames_only):
+                traj = Trajectory(
+                    frames=frames,
+                    frames_shape=tuple(frames.shape),
+                    task=task,
+                    id=str(i),
+                    metadata={"subsequence_length": sub_lengths[i]},
+                    video_embeddings=None,
+                )
+                samples.append(ProgressSample(trajectory=traj, sample_type="progress"))
+            batch = batch_collator(samples)
+            sub_inputs = batch["progress_inputs"]
+            sub_results = _gpu_inference_single(
+                sub_inputs, device, reward_model, tokenizer,
+                prepared.is_discrete, prepared.num_bins, sub_lengths,
+            )
+            all_results.extend(sub_results)
+            torch.cuda.empty_cache()
+
+        return all_results
+
+
+def post_process_and_write(
+    results: list[tuple[np.ndarray, np.ndarray]],
+    prepared: PreparedBatch,
+    output_dir: Path,
+    dataset_info: DatasetInfo,
+    stats: dict[str, WelfordStats],
+) -> None:
+    """CPU-only: compute fingerprints, write TFRecords, update stats.
+
+    Safe to run in a background thread. Note: stats updates are NOT thread-safe
+    on their own, but we ensure only one write future runs at a time by draining
+    the previous write before submitting the next.
+    """
+    for i, idx in enumerate(prepared.batch_valid_indices):
+        progress, success = results[i]
+        frames, orig_indices = prepared.batch_frames[i]
+
+        # Vectorized fingerprint computation
+        fingerprints = cheap_fingerprint32_batch(frames)
+
+        # Write annotation TFRecord
+        tfrecord_path = dataset_info.file_paths[idx]
+        original_name = os.path.basename(tfrecord_path)
+        output_path = str(output_dir / original_name)
+        write_annotation_tfrecord(
+            output_path, progress, success, fingerprints, orig_indices,
+        )
+
+        # Update Welford stats
+        for t in range(len(progress)):
+            stats["robometer_progress"].update(float(progress[t]))
+        for t in range(len(success)):
+            stats["robometer_success"].update(float(success[t]))
+
+
+# =============================================================================
 # Worker Function (one per GPU)
 # =============================================================================
 
@@ -521,7 +801,14 @@ def worker_fn(
     args: argparse.Namespace,
     dataset_info: DatasetInfo,
 ) -> None:
-    """Process a shard of trajectories on a single GPU."""
+    """Process a shard of trajectories on a single GPU.
+
+    Uses a double-buffered prefetch pipeline:
+      - Background thread prepares the NEXT batch (TFRecord I/O + collation)
+      - Main thread runs GPU inference on the CURRENT batch
+      - Previous batch's post-processing (fingerprints + TFRecord writes)
+        is drained before submitting new post-processing to avoid stats races.
+    """
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     batch_size = getattr(args, "batch_size", 1)
     frame_step = getattr(args, "frame_step", 1)
@@ -534,8 +821,10 @@ def worker_fn(
     all_indices = list(range(dataset_info.num_trajectories))
     my_indices = all_indices[rank::num_workers]
 
-    # Sort by episode length to minimize padding waste within batches
-    my_indices.sort(key=lambda i: dataset_info.episode_lengths[i])
+    # Sort by episode length DESCENDING — process longest trajectories first
+    # when GPU memory is cleanest, shortest (cheapest) last.
+    # Within each batch, similar lengths still minimize padding waste.
+    my_indices.sort(key=lambda i: dataset_info.episode_lengths[i], reverse=True)
 
     logger.info(
         f"[Worker {rank}] Processing {len(my_indices)} / "
@@ -543,7 +832,7 @@ def worker_fn(
     )
 
     # Load Robometer model on this GPU
-    exp_config, tokenizer, processor, reward_model, batch_collator = load_robometer(
+    exp_config, tokenizer, _processor, reward_model, batch_collator = load_robometer(
         args.model_path, device
     )
 
@@ -561,84 +850,95 @@ def worker_fn(
     total_infer_time = 0.0
     t_start = time.time()
 
-    # Process in micro-batches
-    for batch_start in tqdm.tqdm(range(0, len(my_indices), batch_size)):
-        batch_indices = my_indices[batch_start : batch_start + batch_size]
+    # Build list of batch index slices with adaptive sizing.
+    # The requested batch_size is a trajectory count, but what actually matters
+    # for GPU memory is the total number of frames (attention is quadratic in
+    # sequence length). We use the requested batch_size to derive a frame budget:
+    #   frame_budget = batch_size * median_episode_length
+    # Then we greedily pack trajectories into batches without exceeding that budget.
+    # This prevents OOM on batches of long trajectories while still packing
+    # short trajectories densely.
+    my_episode_lengths = [dataset_info.episode_lengths[i] for i in my_indices]
+    if my_episode_lengths:
+        sorted_lens = sorted(my_episode_lengths)
+        median_len = sorted_lens[len(sorted_lens) // 2]
+    else:
+        median_len = 34  # fallback
+    frame_budget = batch_size * max(median_len, 1)
+    logger.info(
+        f"[Worker {rank}] Adaptive batching: frame_budget={frame_budget} "
+        f"(batch_size={batch_size} x median_len={median_len})"
+    )
 
-        # Read all frames for this micro-batch
-        batch_frames = []
-        batch_valid_indices = []
-        t_read_start = time.time()
-        for idx in batch_indices:
-            tfrecord_path = dataset_info.file_paths[idx]
-            num_frames = dataset_info.episode_lengths[idx]
-            encoding = dataset_info.encodings[idx]
+    batch_slices = []
+    current_batch = []
+    current_frames = 0
+    for idx in my_indices:
+        ep_len = dataset_info.episode_lengths[idx]
+        effective_len = max(1, (ep_len + frame_step - 1) // frame_step)  # account for subsampling
+        # Always allow at least 1 trajectory per batch
+        if current_batch and current_frames + effective_len > frame_budget:
+            batch_slices.append(current_batch)
+            current_batch = []
+            current_frames = 0
+        current_batch.append(idx)
+        current_frames += effective_len
+    if current_batch:
+        batch_slices.append(current_batch)
 
-            if not os.path.exists(tfrecord_path):
-                logger.warning(
-                    f"[Worker {rank}] Missing file: {tfrecord_path}, skipping"
-                )
-                continue
+    if not batch_slices:
+        return
 
-            frames, orig_indices = read_trajectory_frames(
-                tfrecord_path, num_frames, encoding, frame_step=frame_step,
+    # --- Prefetch pipeline ---
+    prefetch_executor = ThreadPoolExecutor(max_workers=1)
+    write_executor = ThreadPoolExecutor(max_workers=1)
+    write_future: Future | None = None  # tracks in-flight post-processing
+
+    # Kick off first batch preparation
+    prefetch_future = prefetch_executor.submit(
+        prepare_batch,
+        batch_slices[0], dataset_info, args.task, frame_step,
+        batch_collator, exp_config, rank,
+    )
+
+    for batch_idx in tqdm.tqdm(range(len(batch_slices))):
+        # Wait for current batch's CPU prep
+        t_prep_start = time.time()
+        prepared = prefetch_future.result()
+        t_prep = time.time() - t_prep_start
+
+        # Kick off NEXT batch's CPU prep immediately (overlaps with GPU inference)
+        if batch_idx + 1 < len(batch_slices):
+            prefetch_future = prefetch_executor.submit(
+                prepare_batch,
+                batch_slices[batch_idx + 1], dataset_info, args.task, frame_step,
+                batch_collator, exp_config, rank,
             )
-            if frames.shape[0] == 0:
-                logger.warning(
-                    f"[Worker {rank}] Empty trajectory: {tfrecord_path}"
-                )
-                continue
 
-            batch_frames.append((frames, orig_indices))
-            batch_valid_indices.append(idx)
-        t_read = time.time() - t_read_start
-
-        if not batch_frames:
+        if prepared is None:
             continue
 
-        batch_total_frames = sum(f.shape[0] for f, _ in batch_frames)
+        # Drain previous write before starting new one (stats are not thread-safe)
+        if write_future is not None:
+            write_future.result()
 
-        # Run batched Robometer inference
+        # GPU inference
         t_infer_start = time.time()
-        results = run_robometer_inference_batched(
-            frames_list=[f for f, _ in batch_frames],
-            task=args.task,
-            reward_model=reward_model,
-            tokenizer=tokenizer,
-            exp_config=exp_config,
-            batch_collator=batch_collator,
-            device=device,
+        results = gpu_inference(
+            prepared, device, reward_model, tokenizer,
+            batch_collator, args.task,
         )
         t_infer = time.time() - t_infer_start
 
-        # Write results and update stats for each trajectory
-        t_write_start = time.time()
-        for i, idx in enumerate(batch_valid_indices):
-            progress, success = results[i]
-            frames, orig_indices = batch_frames[i]
+        # Submit post-processing to background thread
+        write_future = write_executor.submit(
+            post_process_and_write,
+            results, prepared, output_dir, dataset_info, stats,
+        )
 
-            # Compute fingerprints
-            fingerprints = [
-                cheap_fingerprint32(frames[t]) for t in range(frames.shape[0])
-            ]
-
-            # Write annotation TFRecord
-            tfrecord_path = dataset_info.file_paths[idx]
-            original_name = os.path.basename(tfrecord_path)
-            output_path = str(output_dir / original_name)
-            write_annotation_tfrecord(
-                output_path, progress, success, fingerprints, orig_indices,
-            )
-
-            # Update Welford stats
-            for t in range(len(progress)):
-                stats["robometer_progress"].update(float(progress[t]))
-            for t in range(len(success)):
-                stats["robometer_success"].update(float(success[t]))
-        t_write = time.time() - t_write_start
-
-        num_processed += len(batch_valid_indices)
-        total_frames += batch_total_frames
+        # Update counters
+        num_processed += len(prepared.batch_valid_indices)
+        total_frames += prepared.batch_total_frames
         total_infer_time += t_infer
         elapsed = time.time() - t_start
         avg_time_per_traj = elapsed / num_processed if num_processed > 0 else 0
@@ -647,10 +947,17 @@ def worker_fn(
         logger.info(
             f"[Worker {rank}] {num_processed}/{len(my_indices)} trajs "
             f"({avg_time_per_traj:.2f}s/traj, {avg_infer_per_traj:.2f}s infer/traj, "
-            f"{fps:.0f} frames/s) | batch: {len(batch_valid_indices)} trajs, "
-            f"{batch_total_frames} frames | "
-            f"read={t_read:.2f}s infer={t_infer:.2f}s write={t_write:.2f}s"
+            f"{fps:.0f} frames/s) | batch: {len(prepared.batch_valid_indices)} trajs, "
+            f"{prepared.batch_total_frames} frames | "
+            f"prep_wait={t_prep:.2f}s infer={t_infer:.2f}s"
         )
+
+    # Drain final write
+    if write_future is not None:
+        write_future.result()
+
+    prefetch_executor.shutdown(wait=True)
+    write_executor.shutdown(wait=True)
 
     # Write per-shard stats and timing
     shard_stats_path = output_dir / f"_stats_shard_{rank}.json"
@@ -811,8 +1118,8 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=4,
-        help="Number of trajectories per Robometer forward pass (default: 4). "
+        default=32,
+        help="Number of trajectories per Robometer forward pass (default: 32). "
         "Higher values improve GPU utilization but use more memory.",
     )
     parser.add_argument(
