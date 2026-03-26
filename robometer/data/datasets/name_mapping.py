@@ -93,4 +93,6 @@ DS_SHORT_NAME_MAPPING = {
     "abraranwar_usc_koch_rewind_rfm_usc_koch_rewind": "usc_koch_rewind",
     # RoboFAC
     "aliangdw_robofac_rbm_robofac": "robofac",
+    # ManiSkill Push-T Sim
+    "maniskill_pusht_sim_rfm_maniskill_pusht_sim": "maniskill_pusht_sim",
 }

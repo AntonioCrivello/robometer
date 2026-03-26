@@ -1049,6 +1049,15 @@ def main(cfg: GenerateConfig):
             max_trajectories=cfg.output.max_trajectories,
         )
         trajectories = flatten_task_data(task_data)
+    elif "maniskill_pusht" in cfg.dataset.dataset_name.lower():
+        from dataset_upload.dataset_loaders.maniskill_pusht_sim_loader import load_maniskill_pusht_sim_dataset
+
+        print(f"Loading Maniskill Push-T dataset from: {cfg.dataset.dataset_path}")
+        task_data = load_maniskill_pusht_sim_dataset(
+            cfg.dataset.dataset_path,
+            dataset_name=cfg.dataset.dataset_name,
+        )
+        trajectories = flatten_task_data(task_data)
     else:
         raise ValueError(f"Unknown dataset type: {cfg.dataset.dataset_name}")
 

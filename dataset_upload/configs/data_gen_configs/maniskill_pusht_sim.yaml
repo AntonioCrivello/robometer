@@ -1,0 +1,16 @@
+# Maniskill Push-T Sim dataset configuration
+dataset:
+  dataset_path: /scratch/gpfs/FISAC/ac8755/open_dreams/pusht_eval_200
+  dataset_name: maniskill_pusht_sim
+
+output:
+  output_dir: /scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim
+  max_trajectories: -1
+  max_frames: 64
+  use_video: true
+  fps: 10
+  num_workers: 2
+
+hub:
+  push_to_hub: false  # Set to true when ready to upload
+  hub_repo_id: maniskill_pusht_sim_rfm

@@ -795,41 +795,71 @@ def post_process_and_write(
 # =============================================================================
 
 
+def build_batch_slices(
+    dataset_info: DatasetInfo,
+    batch_size: int,
+    frame_step: int,
+) -> list[list[int]]:
+    """Build adaptive batch slices from all trajectories.
+
+    Sorts trajectories by episode length descending (longest first) and packs
+    them into batches using a frame budget rather than a fixed trajectory count.
+    This prevents OOM on batches of long trajectories while still packing short
+    trajectories densely.
+
+    Called once in the main process; the resulting slices are distributed to
+    workers via a shared mp.Queue for work-stealing load balancing.
+    """
+    all_indices = list(range(dataset_info.num_trajectories))
+    # Sort descending — longest first when GPU memory is cleanest
+    all_indices.sort(key=lambda i: dataset_info.episode_lengths[i], reverse=True)
+
+    # Derive frame budget from batch_size * median episode length
+    sorted_lens = sorted(dataset_info.episode_lengths)
+    median_len = sorted_lens[len(sorted_lens) // 2] if sorted_lens else 34
+    frame_budget = batch_size * max(median_len, 1)
+
+    batch_slices = []
+    current_batch: list[int] = []
+    current_frames = 0
+    for idx in all_indices:
+        ep_len = dataset_info.episode_lengths[idx]
+        effective_len = max(1, (ep_len + frame_step - 1) // frame_step)
+        if current_batch and current_frames + effective_len > frame_budget:
+            batch_slices.append(current_batch)
+            current_batch = []
+            current_frames = 0
+        current_batch.append(idx)
+        current_frames += effective_len
+    if current_batch:
+        batch_slices.append(current_batch)
+
+    return batch_slices
+
+
 def worker_fn(
     rank: int,
     num_workers: int,
     args: argparse.Namespace,
     dataset_info: DatasetInfo,
+    work_queue: mp.Queue | None = None,
+    total_batches: int = 0,
 ) -> None:
-    """Process a shard of trajectories on a single GPU.
+    """Process batches of trajectories on a single GPU.
 
-    Uses a double-buffered prefetch pipeline:
+    Uses a shared work queue (inspired by MultiGPUEvalServer's GPU pool pattern)
+    for work-stealing load balancing: whichever GPU finishes first grabs the next
+    batch. If work_queue is None, falls back to static sharding.
+
+    Within each worker, uses a double-buffered prefetch pipeline:
       - Background thread prepares the NEXT batch (TFRecord I/O + collation)
       - Main thread runs GPU inference on the CURRENT batch
       - Previous batch's post-processing (fingerprints + TFRecord writes)
         is drained before submitting new post-processing to avoid stats races.
     """
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    batch_size = getattr(args, "batch_size", 1)
     frame_step = getattr(args, "frame_step", 1)
-    logger.info(
-        f"[Worker {rank}/{num_workers}] Starting on {device}, "
-        f"batch_size={batch_size}, frame_step={frame_step}"
-    )
-
-    # Determine this worker's trajectory indices
-    all_indices = list(range(dataset_info.num_trajectories))
-    my_indices = all_indices[rank::num_workers]
-
-    # Sort by episode length DESCENDING — process longest trajectories first
-    # when GPU memory is cleanest, shortest (cheapest) last.
-    # Within each batch, similar lengths still minimize padding waste.
-    my_indices.sort(key=lambda i: dataset_info.episode_lengths[i], reverse=True)
-
-    logger.info(
-        f"[Worker {rank}] Processing {len(my_indices)} / "
-        f"{dataset_info.num_trajectories} trajectories"
-    )
+    logger.info(f"[Worker {rank}/{num_workers}] Starting on {device}")
 
     # Load Robometer model on this GPU
     exp_config, tokenizer, _processor, reward_model, batch_collator = load_robometer(
@@ -850,107 +880,88 @@ def worker_fn(
     total_infer_time = 0.0
     t_start = time.time()
 
-    # Build list of batch index slices with adaptive sizing.
-    # The requested batch_size is a trajectory count, but what actually matters
-    # for GPU memory is the total number of frames (attention is quadratic in
-    # sequence length). We use the requested batch_size to derive a frame budget:
-    #   frame_budget = batch_size * median_episode_length
-    # Then we greedily pack trajectories into batches without exceeding that budget.
-    # This prevents OOM on batches of long trajectories while still packing
-    # short trajectories densely.
-    my_episode_lengths = [dataset_info.episode_lengths[i] for i in my_indices]
-    if my_episode_lengths:
-        sorted_lens = sorted(my_episode_lengths)
-        median_len = sorted_lens[len(sorted_lens) // 2]
-    else:
-        median_len = 34  # fallback
-    frame_budget = batch_size * max(median_len, 1)
-    logger.info(
-        f"[Worker {rank}] Adaptive batching: frame_budget={frame_budget} "
-        f"(batch_size={batch_size} x median_len={median_len})"
-    )
-
-    batch_slices = []
-    current_batch = []
-    current_frames = 0
-    for idx in my_indices:
-        ep_len = dataset_info.episode_lengths[idx]
-        effective_len = max(1, (ep_len + frame_step - 1) // frame_step)  # account for subsampling
-        # Always allow at least 1 trajectory per batch
-        if current_batch and current_frames + effective_len > frame_budget:
-            batch_slices.append(current_batch)
-            current_batch = []
-            current_frames = 0
-        current_batch.append(idx)
-        current_frames += effective_len
-    if current_batch:
-        batch_slices.append(current_batch)
-
-    if not batch_slices:
-        return
+    # --- Helper to get next batch from the shared queue ---
+    def next_batch_indices() -> list[int] | None:
+        """Pull next batch from shared queue; returns None when exhausted."""
+        if work_queue is None:
+            return None
+        try:
+            return work_queue.get_nowait()
+        except Exception:
+            return None
 
     # --- Prefetch pipeline ---
     prefetch_executor = ThreadPoolExecutor(max_workers=1)
     write_executor = ThreadPoolExecutor(max_workers=1)
-    write_future: Future | None = None  # tracks in-flight post-processing
+    write_future: Future | None = None
 
-    # Kick off first batch preparation
+    # Grab first batch and kick off preparation
+    first_indices = next_batch_indices()
+    if first_indices is None:
+        logger.info(f"[Worker {rank}] No batches to process")
+        return
+
     prefetch_future = prefetch_executor.submit(
         prepare_batch,
-        batch_slices[0], dataset_info, args.task, frame_step,
+        first_indices, dataset_info, args.task, frame_step,
         batch_collator, exp_config, rank,
     )
 
-    for batch_idx in tqdm.tqdm(range(len(batch_slices))):
+    batches_done = 0
+    while True:
         # Wait for current batch's CPU prep
         t_prep_start = time.time()
         prepared = prefetch_future.result()
         t_prep = time.time() - t_prep_start
 
-        # Kick off NEXT batch's CPU prep immediately (overlaps with GPU inference)
-        if batch_idx + 1 < len(batch_slices):
+        # Grab next batch from queue and kick off prefetch immediately
+        next_indices = next_batch_indices()
+        if next_indices is not None:
             prefetch_future = prefetch_executor.submit(
                 prepare_batch,
-                batch_slices[batch_idx + 1], dataset_info, args.task, frame_step,
+                next_indices, dataset_info, args.task, frame_step,
                 batch_collator, exp_config, rank,
             )
 
-        if prepared is None:
-            continue
+        if prepared is not None:
+            # Drain previous write before starting new one (stats thread safety)
+            if write_future is not None:
+                write_future.result()
 
-        # Drain previous write before starting new one (stats are not thread-safe)
-        if write_future is not None:
-            write_future.result()
+            # GPU inference
+            t_infer_start = time.time()
+            results = gpu_inference(
+                prepared, device, reward_model, tokenizer,
+                batch_collator, args.task,
+            )
+            t_infer = time.time() - t_infer_start
 
-        # GPU inference
-        t_infer_start = time.time()
-        results = gpu_inference(
-            prepared, device, reward_model, tokenizer,
-            batch_collator, args.task,
-        )
-        t_infer = time.time() - t_infer_start
+            # Submit post-processing to background thread
+            write_future = write_executor.submit(
+                post_process_and_write,
+                results, prepared, output_dir, dataset_info, stats,
+            )
 
-        # Submit post-processing to background thread
-        write_future = write_executor.submit(
-            post_process_and_write,
-            results, prepared, output_dir, dataset_info, stats,
-        )
+            # Update counters
+            num_processed += len(prepared.batch_valid_indices)
+            total_frames += prepared.batch_total_frames
+            total_infer_time += t_infer
+            batches_done += 1
+            elapsed = time.time() - t_start
+            avg_time_per_traj = elapsed / num_processed if num_processed > 0 else 0
+            avg_infer_per_traj = total_infer_time / num_processed if num_processed > 0 else 0
+            fps = total_frames / total_infer_time if total_infer_time > 0 else 0
+            logger.info(
+                f"[Worker {rank}] {num_processed} trajs done "
+                f"(batch {batches_done}/{total_batches}, "
+                f"{avg_time_per_traj:.2f}s/traj, {avg_infer_per_traj:.2f}s infer/traj, "
+                f"{fps:.0f} frames/s) | "
+                f"prep_wait={t_prep:.2f}s infer={t_infer:.2f}s"
+            )
 
-        # Update counters
-        num_processed += len(prepared.batch_valid_indices)
-        total_frames += prepared.batch_total_frames
-        total_infer_time += t_infer
-        elapsed = time.time() - t_start
-        avg_time_per_traj = elapsed / num_processed if num_processed > 0 else 0
-        avg_infer_per_traj = total_infer_time / num_processed if num_processed > 0 else 0
-        fps = total_frames / total_infer_time if total_infer_time > 0 else 0
-        logger.info(
-            f"[Worker {rank}] {num_processed}/{len(my_indices)} trajs "
-            f"({avg_time_per_traj:.2f}s/traj, {avg_infer_per_traj:.2f}s infer/traj, "
-            f"{fps:.0f} frames/s) | batch: {len(prepared.batch_valid_indices)} trajs, "
-            f"{prepared.batch_total_frames} frames | "
-            f"prep_wait={t_prep:.2f}s infer={t_infer:.2f}s"
-        )
+        # If no more batches queued, we're done
+        if next_indices is None:
+            break
 
     # Drain final write
     if write_future is not None:
@@ -1160,15 +1171,31 @@ def main() -> None:
 
     logger.info(f"Using {num_gpus} GPU(s) for annotation")
 
+    # Build batch slices centrally — adaptive sizing based on frame budget
+    batch_size = getattr(args, "batch_size", 32)
+    frame_step = getattr(args, "frame_step", 1)
+    batch_slices = build_batch_slices(dataset_info, batch_size, frame_step)
+    logger.info(
+        f"Built {len(batch_slices)} batch slices "
+        f"(adaptive frame budget = {batch_size} * median_len)"
+    )
+
     if num_gpus <= 1:
-        # Single-process mode (no spawn overhead)
-        worker_fn(0, 1, args, dataset_info)
+        # Single-process mode — feed batches via mp.Queue (same code path)
+        work_queue = mp.Queue()
+        for batch in batch_slices:
+            work_queue.put(batch)
+        worker_fn(0, 1, args, dataset_info, work_queue, len(batch_slices))
     else:
-        # Multi-GPU: spawn one worker per GPU
+        # Multi-GPU: shared work queue for work-stealing load balancing
+        # (inspired by MultiGPUEvalServer's GPU pool pattern)
         mp.set_start_method("spawn", force=True)
+        work_queue = mp.Queue()
+        for batch in batch_slices:
+            work_queue.put(batch)
         mp.spawn(
             worker_fn,
-            args=(num_gpus, args, dataset_info),
+            args=(num_gpus, args, dataset_info, work_queue, len(batch_slices)),
             nprocs=num_gpus,
             join=True,
         )
