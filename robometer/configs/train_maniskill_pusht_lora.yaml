@@ -1,0 +1,56 @@
+# LoRA finetuning config for ManiSkill Push-T Sim
+# Usage:
+#   export ROBOMETER_PROCESSED_DATASETS_PATH=/scratch/gpfs/FISAC/ac8755/robometer/processed_datasets
+#   uv run python train.py --config-name=train_maniskill_pusht_lora
+#
+# Multi-GPU:
+#   uv run accelerate launch --config_file robometer/configs/distributed/fsdp.yaml \
+#       train.py --config-name=train_maniskill_pusht_lora
+
+defaults:
+  - config  # inherit all defaults from config.yaml
+  - _self_  # our overrides take priority
+
+# Model: LoRA on Robometer-4B, no unsloth (crashes on Della)
+model:
+  base_model_id: Qwen/Qwen3-VL-4B-Instruct
+  use_peft: true
+  use_unsloth: false
+
+# Data: our preprocessed PushT dataset
+data:
+  train_datasets:
+    - "/scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_train/maniskill_pusht_sim_train/default"
+  eval_datasets:
+    - "/scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_eval/maniskill_pusht_sim_eval/default"
+  dataloader_num_workers: 32
+  preference_strategy_ratio: [1, 1, 0, 1]  # disable different_task (index 2) — single-task dataset
+
+# Training
+training:
+  load_from_checkpoint: "robometer/Robometer-4B"
+  per_device_train_batch_size: 24
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_steps: 1000
+  save_strategy: "steps"
+  save_steps: 200
+  gradient_checkpointing: false
+  output_dir: /scratch/gpfs/FISAC/ac8755/robometer/logs/robometer4b_lora_pusht_5k_w_pref_v2
+  exp_name: robometer4b_lora_pusht_5k_w_pref_v2
+  overwrite_output_dir: true
+  # Eval during training (uses our dataset, not external benchmarks)
+  do_eval: true
+  eval_steps: 200
+  custom_eval_steps: 0  # disable custom eval (policy_ranking etc) since we don't have those datasets
+
+# Disable custom eval types that require external datasets
+custom_eval:
+  eval_types: []
+
+# Logging
+logging:
+  log_to: [wandb]
+  wandb_project: robometer-pusht
+  wandb_entity: safe-robotics
