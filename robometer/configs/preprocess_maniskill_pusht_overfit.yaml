@@ -1,0 +1,25 @@
+# Preprocess config for overfit experiment — same 32 trajectories for train and eval
+train_datasets:
+  - "/scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_32_overfit/maniskill_pusht_sim_overfit"
+
+train_subsets:
+  - ["default"]
+
+eval_datasets:
+  - "/scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_32_overfit/maniskill_pusht_sim_overfit"
+
+eval_subsets:
+  - ["default"]
+
+max_frames_for_preprocessing: 32
+video_frame_sampling: "uniform"
+num_proc: 1
+num_threads: 4
+force_reprocess: false
+cache_dir: /scratch/gpfs/FISAC/ac8755/robometer/processed_datasets
+
+precompute_embeddings: false
+embeddings_cache_dir: "embeddings"
+dinov2_model: "facebook/dinov2-base"
+sentence_model: "sentence-transformers/all-MiniLM-L12-v2"
+embedding_batch_size: 64

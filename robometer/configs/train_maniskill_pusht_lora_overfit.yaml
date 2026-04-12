@@ -1,0 +1,44 @@
+# LoRA overfit experiment — 32 trajectories, high LR, many epochs
+# Goal: confirm model CAN perfectly memorize data (loss → ~0). If not, pipeline is broken.
+defaults:
+  - config
+  - _self_
+
+model:
+  base_model_id: Qwen/Qwen3-VL-4B-Instruct
+  use_peft: true
+  use_unsloth: false
+
+data:
+  train_datasets:
+    - "/scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_32_overfit/maniskill_pusht_sim_overfit/default"
+  eval_datasets:
+    - "/scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_32_overfit/maniskill_pusht_sim_overfit/default"
+  max_frames: 8
+  dataloader_num_workers: 4
+  preference_strategy_ratio: [1, 1, 0, 1]
+
+training:
+  load_from_checkpoint: "robometer/Robometer-4B"
+  per_device_train_batch_size: 8
+  learning_rate: 5.0e-5
+  warmup_ratio: 0.0
+  weight_decay: 0.0
+  max_steps: 2000
+  save_strategy: "steps"
+  save_steps: 500
+  gradient_checkpointing: true
+  output_dir: /scratch/gpfs/FISAC/ac8755/robometer/logs/robometer4b_lora_pusht_32_overfit_v2_revert_prog_mask
+  exp_name: robometer4b_lora_pusht_32_overfit_v2_revert_prog_mask
+  overwrite_output_dir: true
+  do_eval: true
+  eval_steps: 50
+  custom_eval_steps: 0
+
+custom_eval:
+  eval_types: []
+
+logging:
+  log_to: [wandb]
+  wandb_project: robometer-pusht
+  wandb_entity: safe-robotics

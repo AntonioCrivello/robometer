@@ -1,0 +1,17 @@
+# Maniskill Push-T Sim overfit experiment — 32 trajectories for memorization test
+dataset:
+  dataset_path: /scratch/gpfs/FISAC/ac8755/open_dreams/maniskill_pusht_wide_recovery_5k
+  dataset_name: maniskill_pusht_sim_overfit
+
+output:
+  output_dir: /scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_32_overfit
+  max_trajectories: 32
+  trajectory_offset: 0
+  max_frames: 64
+  use_video: true
+  fps: 10
+  num_workers: 2
+
+hub:
+  push_to_hub: false
+  hub_repo_id: maniskill_pusht_sim_overfit_rfm

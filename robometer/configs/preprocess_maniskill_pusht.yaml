@@ -1,0 +1,38 @@
+# Preprocess config for LoRA fine-tuning on Maniskill PushT Sim after running generate_hf_dataset with maniskill_pusht_sim.yaml.
+# Use with: uv run python -m robometer.data.scripts.preprocess_datasets --config robometer/configs/preprocess_maniskill_pusht.yaml
+#
+# Order: 1) generate_hf_dataset (robofac.yaml) → 2) this preprocess → 3) train.
+# Run from repo root so the path below resolves, or use an absolute path for train_datasets/eval_datasets.
+#
+# Before running:
+#   export ROBOMETER_PROCESSED_DATASETS_PATH=/path/to/save/processed_datasets  # for training
+#
+# For training, set data.train_datasets and data.eval_datasets to the cache key: "robometer_data/robometer_data/maniskill_pusht_sim/maniskill_pusht_sim"
+# (dataset_path/subset). See FINETUNE_ROBOMETER.md.
+
+# Path to the converted dataset (output_dir/dataset_name from robofac.yaml = robometer_data/robometer_data/maniskill_pusht_sim/maniskill_pusht_sim)
+train_datasets:
+  - "/scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_train_4800_thresh03_v2/maniskill_pusht_sim_train"
+
+train_subsets:
+  - ["default"]
+
+eval_datasets:
+  - "/scratch/gpfs/FISAC/ac8755/robometer/robometer_data/maniskill_pusht_sim_eval_200_thresh03_v2/maniskill_pusht_sim_eval"
+
+eval_subsets:
+  - ["default"]
+
+max_frames_for_preprocessing: 32
+video_frame_sampling: "uniform"
+num_proc: 1
+num_threads: 4
+force_reprocess: false
+cache_dir: /scratch/gpfs/FISAC/ac8755/robometer/processed_datasets
+
+# Embedding preprocessing (optional; set false for faster preprocessing without embeddings)
+precompute_embeddings: false
+embeddings_cache_dir: "embeddings"
+dinov2_model: "facebook/dinov2-base"
+sentence_model: "sentence-transformers/all-MiniLM-L12-v2"
+embedding_batch_size: 64

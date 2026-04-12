@@ -53,6 +53,7 @@ ALL_DATASOURCES = [
     "usc_koch_human_robot_paired_robot",
     "hand_paired_human",
     "hand_paired_robot",
+    "robofac",
 ]
 
 DATASET_CATEGORY = {
